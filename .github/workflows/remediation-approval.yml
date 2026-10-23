@@ -1,0 +1,242 @@
+name: Approve RCA remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      correlation_id:
+        description: Correlation ID of the pending RCA
+        type: string
+        required: true
+      branch_name:
+        description: Proposed remediation branch
+        type: string
+        required: true
+      rca_summary:
+        description: Root-cause summary for reviewers
+        type: string
+        required: true
+      patch_diff:
+        description: Proposed unified diff
+        type: string
+        required: true
+      unit_test_code:
+        description: Optional regression test code
+        type: string
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: remediation-${{ inputs.correlation_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-approval:
+    name: Present proposed remediation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate request and create reviewer summary
+        env:
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          RCA_SUMMARY: ${{ inputs.rca_summary }}
+          PATCH_DIFF: ${{ inputs.patch_diff }}
+          UNIT_TEST_CODE: ${{ inputs.unit_test_code }}
+        run: |
+          python - <<'PY'
+          import html
+          import os
+          import re
+          import subprocess
+          import uuid
+
+          correlation_id = os.environ["CORRELATION_ID"].strip()
+          repository = os.environ["REPOSITORY"].strip()
+          branch_name = os.environ["BRANCH_NAME"].strip()
+          rca_summary = os.environ["RCA_SUMMARY"].strip()
+          patch_diff = os.environ["PATCH_DIFF"]
+          unit_test_code = os.environ.get("UNIT_TEST_CODE", "")
+
+          try:
+              uuid.UUID(correlation_id)
+          except ValueError as exc:
+              raise SystemExit("correlation_id must be a UUID") from exc
+
+          if repository != "ManasaWW/emitter-proj-2":
+              raise SystemExit("This workflow is only permitted to remediate this repository")
+          if not re.fullmatch(r"fix/auto-heal-[A-Za-z0-9._/-]+", branch_name):
+              raise SystemExit("branch_name must use the fix/auto-heal- prefix")
+          if subprocess.run(
+              ["git", "check-ref-format", "--branch", branch_name],
+              check=False,
+              capture_output=True,
+          ).returncode:
+              raise SystemExit("branch_name is not a valid Git branch name")
+          if not rca_summary or not patch_diff.strip():
+              raise SystemExit("rca_summary and patch_diff are required")
+
+          def details(title: str, value: str) -> str:
+              return (
+                  f"<details><summary>{html.escape(title)}</summary>\n\n"
+                  f"<pre>\n{html.escape(value)}\n</pre>\n\n</details>\n"
+              )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("# Proposed RCA remediation — review required\n\n")
+              summary.write(
+                  "The next job is protected by the `remediation-approval` GitHub Environment. "
+                  "Review this RCA and diff before approving it.\n\n"
+              )
+              summary.write(f"- **Correlation ID:** `{html.escape(correlation_id)}`\n")
+              summary.write(f"- **Repository:** `{html.escape(repository)}`\n")
+              summary.write(f"- **Branch:** `{html.escape(branch_name)}`\n\n")
+              summary.write("## Root cause\n\n")
+              summary.write(f"{html.escape(rca_summary)}\n\n")
+              summary.write("## Proposed patch\n\n")
+              summary.write(details("Expand patch diff", patch_diff))
+              if unit_test_code.strip():
+                  summary.write("\n## Proposed regression test\n\n")
+                  summary.write(details("Expand test code", unit_test_code))
+          PY
+
+  invoke-remediation:
+    name: Invoke remediation after approval
+    needs: prepare-approval
+    runs-on: ubuntu-latest
+    environment:
+      name: remediation-approval
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Validate endpoint configuration
+        env:
+          REMEDIATION_URL: ${{ vars.REMEDIATION_AGENT_JSONRPC_URL }}
+          REMEDIATION_API_SCOPE: ${{ vars.REMEDIATION_API_SCOPE }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          endpoint = os.environ.get("REMEDIATION_URL", "").strip()
+          scope = os.environ.get("REMEDIATION_API_SCOPE", "").strip()
+          parsed = urlparse(endpoint)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("REMEDIATION_AGENT_JSONRPC_URL must be HTTPS without embedded credentials")
+          if parsed.path.rstrip("/") != "/agents/remediation/v1/jsonrpc" or parsed.query or parsed.fragment:
+              raise SystemExit("REMEDIATION_AGENT_JSONRPC_URL must end with /agents/remediation/v1/jsonrpc")
+          if not scope.startswith(("api://", "https://")):
+              raise SystemExit("REMEDIATION_API_SCOPE must be an Entra application ID URI")
+          PY
+
+      - name: Sign in with GitHub OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Send approved remediation request
+        env:
+          REMEDIATION_URL: ${{ vars.REMEDIATION_AGENT_JSONRPC_URL }}
+          REMEDIATION_API_SCOPE: ${{ vars.REMEDIATION_API_SCOPE }}
+          CORRELATION_ID: ${{ inputs.correlation_id }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          PATCH_DIFF: ${{ inputs.patch_diff }}
+          UNIT_TEST_CODE: ${{ inputs.unit_test_code }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          access_token="$(az account get-access-token \
+            --scope "${REMEDIATION_API_SCOPE}/.default" \
+            --query accessToken \
+            --output tsv)"
+          if [ -z "$access_token" ]; then
+            echo "Azure CLI returned an empty remediation API token." >&2
+            exit 1
+          fi
+          echo "::add-mask::$access_token"
+
+          python - <<'PY'
+          import json
+          import os
+
+          params = {
+              "correlationId": os.environ["CORRELATION_ID"],
+              "repository": os.environ["REPOSITORY"],
+              "branchName": os.environ["BRANCH_NAME"],
+              "patchDiff": os.environ["PATCH_DIFF"],
+              "approvalDecision": "APPROVED",
+          }
+          test_code = os.environ.get("UNIT_TEST_CODE", "")
+          if test_code.strip():
+              params["unitTestCode"] = test_code
+
+          request = {
+              "jsonrpc": "2.0",
+              "id": os.environ["RUN_ID"],
+              "method": "performRemediation",
+              "params": params,
+          }
+          with open("remediation-request.json", "w", encoding="utf-8") as output:
+              json.dump(request, output)
+          PY
+
+          curl --fail-with-body --silent --show-error \
+            --request POST "$REMEDIATION_URL" \
+            --header "Authorization: Bearer $access_token" \
+            --header "Content-Type: application/json" \
+            --data-binary @remediation-request.json \
+            --output remediation-response.json
+
+          python - <<'PY'
+          import html
+          import json
+          import os
+          from urllib.parse import urlparse
+
+          with open("remediation-response.json", encoding="utf-8") as response_file:
+              response = json.load(response_file)
+
+          if response.get("jsonrpc") != "2.0" or str(response.get("id")) != os.environ["RUN_ID"]:
+              raise SystemExit("Remediation API returned an invalid JSON-RPC envelope")
+          if "error" in response:
+              raise SystemExit(f"Remediation API returned a JSON-RPC error: {response['error']}")
+
+          result = response.get("result")
+          if not isinstance(result, dict):
+              raise SystemExit("Remediation API response has no result object")
+          if result.get("approvalStatus") != "APPROVED":
+              raise SystemExit("Remediation API did not report an approved remediation")
+          if result.get("sandboxStatus") != "PASSED":
+              raise SystemExit("Remediation API did not report successful sandbox validation")
+
+          repository = os.environ["REPOSITORY"]
+          pr_url = result.get("prUrl", "")
+          pr_number = result.get("prNumber")
+          parsed = urlparse(pr_url)
+          if (
+              not isinstance(pr_number, int)
+              or pr_number <= 0
+              or parsed.scheme != "https"
+              or parsed.netloc.casefold() != "github.com"
+              or parsed.path.casefold() != f"/{repository}/pull/{pr_number}".casefold()
+              or parsed.query
+              or parsed.fragment
+          ):
+              raise SystemExit(
+                  "Remediation did not return a valid GitHub pull request URL for this repository"
+              )
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("# Remediation result\n\n")
+              summary.write(f"- **Sandbox:** {result['sandboxStatus']}\n")
+              summary.write(f"- **Pull request:** &lt;{html.escape(pr_url)}&gt;\n")
+              summary.write(
+                  f"- **Summary:** {html.escape(str(result.get('summary', 'No summary returned.')))}\n"
+              )
+          PY

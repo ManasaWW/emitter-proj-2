@@ -2,6 +2,68 @@
 
 # AI Agents A-Z
 
+## Human approval for RCA remediation
+
+The workflow at `.github/workflows/remediation-approval.yml` provides the Gate 1 approval step
+for `ManasaWW/emitter-proj-2`. It shows the RCA, proposed branch, patch, and optional regression
+test in the Actions run summary. The remediation job targets the protected GitHub Environment
+`remediation-approval`; GitHub pauses it until an authorized reviewer approves. Only then does
+the job obtain an Entra token through GitHub OIDC and call the remediation API.
+
+### Configure GitHub Actions
+
+1. Open **Settings > Environments** and create an environment named exactly
+   `remediation-approval`.
+2. Add the authorized people or teams under **Required reviewers**. Enable **Prevent
+   self-review** and restrict deployment branches to trusted branches where available.
+   Required-reviewer protection depends on repository visibility and GitHub plan.
+3. Add these environment variables:
+
+   | Variable | Value |
+   | --- | --- |
+   | `AZURE_CLIENT_ID` | Entra application/client ID configured for GitHub OIDC |
+   | `AZURE_TENANT_ID` | Entra tenant ID that owns the remediation API |
+   | `REMEDIATION_API_SCOPE` | API Application ID URI, e.g. `api://sre-agent-mesh` |
+   | `REMEDIATION_AGENT_JSONRPC_URL` | HTTPS endpoint ending `/agents/remediation/v1/jsonrpc` |
+
+   These are identifiers and URLs, not secrets. Do not put access tokens or private keys in
+   workflow inputs or run summaries.
+
+### Configure Entra OIDC and API authorization
+
+1. In the Entra app registration identified by `AZURE_CLIENT_ID`, add a federated credential:
+   - **Issuer:** `https://token.actions.githubusercontent.com`
+   - **Subject:** `repo:ManasaWW/emitter-proj-2:environment:remediation-approval`
+   - **Audience:** `api://AzureADTokenExchange`
+2. Expose the remediation API app role `Remediation.Invoke` and assign it to the enterprise
+   application/service principal represented by `AZURE_CLIENT_ID`.
+3. Configure the API to validate token issuer, tenant, audience, and the `Remediation.Invoke`
+   role. This workflow does not need an Azure subscription role; it requests a token only for
+   the API.
+
+### Run and review Gate 1
+
+1. Push this workflow to the default branch (`main`) if it is not already there.
+2. Open **Actions > Approve RCA remediation > Run workflow**.
+3. Enter the RCA correlation UUID, a branch beginning `fix/auto-heal-`, root-cause summary,
+   unified diff, and optional regression test. The target repository is fixed to this repository.
+4. Open the run summary and inspect the RCA and expanded patch/test.
+5. Open the waiting `invoke-remediation` deployment and approve or reject it. If rejected or
+   cancelled, the Azure remediation endpoint is not called.
+6. After approval, inspect the job result. It requires a successful JSON-RPC response, passed
+   sandbox status, and a PR URL belonging to `ManasaWW/emitter-proj-2`.
+
+Step 3 does not automatically dispatch this workflow yet. Start it manually and transfer the RCA
+fields into the workflow inputs. To automate dispatch later, a trusted service should call
+GitHub's `workflow_dispatch` API using a narrowly scoped GitHub App installation token with
+Actions write permission. The run will still wait for the same environment approval.
+
+This is Gate 1, not the complete remediation pipeline. The current remediation backend remains a
+scaffold: it does not clone the source repository, push a branch, or open a real PR. Rejection
+feedback is retained in GitHub Actions history but is not yet persisted to Cosmos DB negative
+memory. Do not use this to authorize real repository changes until the backend is completed and
+verified.
+
 This repository contains code for both my live course: [O'Reilly Live Online Training for AI Agents A-Z](https://learning.oreilly.com/live-events/ai-agents-a-z/0642572007604) and my video series: [Modern Automated AI Agents: Building Agentic AI to Perform Complex Tasks
 ](https://learning.oreilly.com/course/modern-automated-ai/9780135414965/)
 
@@ -188,4 +250,3 @@ python3 -m jupyter notebook
 ## Instructor
 
 **Sinan Ozdemir** Sinan is a former lecturer of Data Science at Johns Hopkins University and the author of multiple textbooks on data science and machine learning. Additionally, he is the founder of the recently acquired Kylie.ai, an enterprise-grade conversational AI platform with RPA capabilities. He holds a master’s degree in Pure Mathematics from Johns Hopkins University and is based in San Francisco, CA.
-
